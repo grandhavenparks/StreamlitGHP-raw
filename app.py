@@ -24,6 +24,7 @@ CLASSIFICATION_CATEGORIES = {
 }
 
 IMG_SIZE = 256
+THUMB_WIDTH = 600
 RESULTS_DIR = "results"
 MAX_UPLOAD = 75
 
@@ -35,21 +36,9 @@ st.set_page_config(layout="wide", page_title="Oak-Wilt Detector")
 st.title("Grand Haven Parks Oak-Wilt Detector")
 st.markdown("Advanced 4-category Oak Wilt classification system")
 
-# Keep feedback toasts pinned to the right of the viewport, regardless of scroll position
 st.markdown(
     """
     <style>
-    [data-testid="stToastContainer"],
-    div:has(> [data-testid="stToast"]) {
-        position: fixed !important;
-        top: 50% !important;
-        right: 1rem !important;
-        bottom: auto !important;
-        left: auto !important;
-        transform: translateY(-50%) !important;
-        z-index: 999999 !important;
-    }
-
     /* "Loading images..." spinner while files are still uploading from the browser */
     [data-testid="stFileUploader"] {
         position: relative;
@@ -73,6 +62,36 @@ st.markdown(
     }
     @keyframes upload-spin {
         to { transform: rotate(360deg); }
+    }
+
+    /* Green feedback banner: disappears after 3s, or immediately with the X */
+    .fb-close {
+        display: none;
+    }
+    .fb-close:checked + .fb-banner {
+        display: none;
+    }
+    .fb-banner {
+        position: relative;
+        background-color: #1E8E3E;
+        color: #FFFFFF;
+        font-weight: bold;
+        padding: 0.5rem 1.75rem 0.5rem 0.75rem;
+        border-radius: 0.5rem;
+        margin-bottom: 0.5rem;
+        overflow: hidden;
+        animation: fb-hide 0s 3s forwards;
+    }
+    .fb-banner label {
+        position: absolute;
+        top: 0.2rem;
+        right: 0.5rem;
+        cursor: pointer;
+        font-size: 1.25rem;
+        line-height: 1;
+    }
+    @keyframes fb-hide {
+        to { visibility: hidden; max-height: 0; padding: 0; margin: 0; }
     }
     </style>
     """,
@@ -105,6 +124,8 @@ if "results" not in st.session_state:
     st.session_state.results = []
 if "processed_filenames" not in st.session_state:
     st.session_state.processed_filenames = set()
+if "feedback_count" not in st.session_state:
+    st.session_state.feedback_count = 0
 
 
 # ===========================
@@ -115,7 +136,7 @@ def classify_prediction(confidence):
     if confidence > 99.5:
         return "THIS PICTURE HAS OAK WILT"
     elif 90 < confidence <= 99.5:
-        return "HIGH CHANCE OF OAK WILTS"
+        return "HIGH CHANCE OF OAK WILT"
     elif 70 < confidence <= 90:
         return "CHANGES OF COLORS ON TREE LEAVES"
     else:
@@ -158,15 +179,23 @@ def process_image(img_bytes):
     img = cv2.imdecode(img_array, cv2.IMREAD_COLOR)
     if img is None:
         raise ValueError("Invalid image")
+
+    # Small JPEG for display, so the full-size upload doesn't need to be kept or sent back to the browser
+    h, w = img.shape[:2]
+    if w > THUMB_WIDTH:
+        thumb = cv2.resize(img, (THUMB_WIDTH, int(h * THUMB_WIDTH / w)), interpolation=cv2.INTER_AREA)
+    else:
+        thumb = img
+    _, thumb_jpg = cv2.imencode(".jpg", thumb, [cv2.IMWRITE_JPEG_QUALITY, 85])
+
     img = cv2.resize(img, (IMG_SIZE, IMG_SIZE))
     img = img.astype(np.float32) / 255.0
     img_input = np.expand_dims(img, axis=0)
-    prediction = model.predict(img_input, verbose=0)[0][0]
+    # Calling the model directly avoids model.predict's per-call setup overhead
+    prediction = float(model(img_input, training=False)[0][0])
     classification = classify_prediction(prediction)
     gps = get_gps_data(img_bytes)
-    del img_array, img, img_input
-    gc.collect()
-    return classification, prediction * 100, gps
+    return classification, prediction * 100, gps, thumb_jpg.tobytes()
 
 
 def generate_csv(results):
@@ -212,12 +241,26 @@ def generate_geojson(results):
     return path
 
 
+def feedback_banner(message, row):
+    # Alternate the wrapper tag on every click so the browser builds a fresh banner,
+    # restarting the 3s timer and clearing a previous X click
+    st.session_state.feedback_count += 1
+    count = st.session_state.feedback_count
+    tag = "section" if count % 2 else "div"
+    uid = f"fb-{row}-{count}"
+    return (
+        f'<{tag}><input type="checkbox" id="{uid}" class="fb-close">'
+        f'<div class="fb-banner"><span>{message}</span>'
+        f'<label for="{uid}" title="Dismiss">&times;</label></div></{tag}>'
+    )
+
+
 def render_results(results):
     for i, result in enumerate(results):
         col1, col2, col3, col4, col5 = st.columns([2, 1, 1, 1, 1])
 
         with col1:
-            st.image(result["img_bytes"], caption=result["filename"], width="stretch")
+            st.image(result["thumbnail"], caption=result["filename"], width="stretch")
 
         with col2:
             st.write("**Classification**")
@@ -240,13 +283,15 @@ def render_results(results):
 
         with col5:
             st.write("**Feedback**")
+            # Placeholder above the buttons so the confirmation shows right where the user clicked
+            feedback_msg = st.empty()
             col_good, col_bad = st.columns(2)
             with col_good:
                 if st.button("Good", key=f"good_{i}_{result['filename']}", help="Correct prediction"):
-                    st.toast("Thanks! Prediction identified as correct.")
+                    feedback_msg.markdown(feedback_banner("Thanks! Prediction identified as correct.", i), unsafe_allow_html=True)
             with col_bad:
                 if st.button("Bad", key=f"bad_{i}_{result['filename']}", help="Incorrect prediction"):
-                    st.toast("Thanks! Prediction identified as incorrect.")
+                    feedback_msg.markdown(feedback_banner("Thanks! Prediction identified as incorrect.", i), unsafe_allow_html=True)
 
         st.markdown("---")
 
@@ -301,18 +346,18 @@ if files:
         with st.spinner("Analyzing images..."):
             for i, file in enumerate(unique_files):
                 img_bytes = file.read()
-                classification, confidence, gps = process_image(img_bytes)
+                classification, confidence, gps, thumbnail = process_image(img_bytes)
                 st.session_state.results.append({
                     "filename": file.name,
-                    "img_bytes": img_bytes,
+                    "thumbnail": thumbnail,
                     "classification": classification,
                     "confidence": confidence,
                     "gps": gps
                 })
                 progress.progress((i + 1) / len(unique_files))
                 del img_bytes
-                gc.collect()
 
+        gc.collect()
         progress.empty()
 
 if st.session_state.results:
